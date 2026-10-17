@@ -8,20 +8,13 @@ editor: visual
 
 ```{r} 
 
+#| message: false
+#| warning: false
+
 # Packages
 library(network)
 library(ergm)
 library(tnet)
-
-# Load the dataset explicitly
-data("Cross.Parker.Consulting.net.info", package = "tnet")
-data("Cross.Parker.Consulting.node.gender", package = "tnet")
-data("Cross.Parker.Consulting.node.region", package = "tnet")
-data("Cross.Parker.Consulting.node.orglevel", package = "tnet")
-
-# Check that the data are available
-exists("Cross.Parker.Consulting.net.info")
-length(Cross.Parker.Consulting.node.gender)
 
 # Data
 consult <- Cross.Parker.Consulting.net.info
@@ -35,7 +28,6 @@ consult <- network(consult[, 1:2], directed = TRUE)
 consult %v% "gender" <- Cross.Parker.Consulting.node.gender
 consult %v% "region" <- Cross.Parker.Consulting.node.region
 consult %v% "orglevel" <- Cross.Parker.Consulting.node.orglevel
-
 
 # Save a copy of the original data
 raw_consult <- Cross.Parker.Consulting.net.info
@@ -179,11 +171,14 @@ This does not necessarily contradict the positive homophily coefficient, since `
 
 # 5. On Your Own: Homophily Based on Organizational Level
 
-I wanted to examine whether individuals are more likely to consult colleagues who occupy the same organizational level. To test this, I estimated an ERGM using the reconstructed network of 46 employees, including density (`edges`), reciprocity (`mutual`), and organizational-level homophily (`nodematch`).
-
-I reconstructed the network to include all 46 employees, including the five individuals with no frequent consultation ties.
+I wanted to examine whether individuals are more likely to consult colleagues who occupy the same organizational level. To test this, I estimated an ERGM using the reconstructed network of 46 employees, including density (edges), reciprocity (mutual), and organizational-level homophily (nodematch).
 
 ```{r}
+
+#| message: false
+#| warning: false
+#| results: hide
+
 set.seed(510)
 
 model_orglevel46 <- ergm(

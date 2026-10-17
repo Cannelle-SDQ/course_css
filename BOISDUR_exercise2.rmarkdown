@@ -1,0 +1,195 @@
+---
+title: "BOISDUR_exercise2"
+format: docx
+editor: visual
+---
+
+# 1. Data Preparation
+
+```{r} 
+
+#| message: false
+#| warning: false
+
+# Packages
+library(network)
+library(ergm)
+library(tnet)
+
+# Data
+consult <- Cross.Parker.Consulting.net.info
+
+consult$w <- ifelse(consult$w < 4, 0, 1)
+
+consult <- consult[consult$w == 1, ]
+
+consult <- network(consult[, 1:2], directed = TRUE)
+
+consult %v% "gender" <- Cross.Parker.Consulting.node.gender
+consult %v% "region" <- Cross.Parker.Consulting.node.region
+consult %v% "orglevel" <- Cross.Parker.Consulting.node.orglevel
+
+# Save a copy of the original data
+raw_consult <- Cross.Parker.Consulting.net.info
+
+# Save employee attributes
+gender46 <- Cross.Parker.Consulting.node.gender
+region46 <- Cross.Parker.Consulting.node.region
+orglevel46 <- Cross.Parker.Consulting.node.orglevel
+
+```
+
+## Reconstructing the Network with All 46 Employees
+
+```{r}
+
+# Reconstruct the network with all 46 employees
+
+frequent_ties <- raw_consult
+frequent_ties <- frequent_ties[frequent_ties$w >= 4, ]
+
+consult46 <- network.initialize(46, directed = TRUE)
+
+
+network::add.edges(
+  consult46,
+  tail = as.integer(frequent_ties[[1]]),
+  head = as.integer(frequent_ties[[2]])
+)
+
+# Assign employee attributes
+consult46 %v% "gender" <- gender46
+consult46 %v% "region" <- region46
+consult46 %v% "orglevel" <- orglevel46
+
+# Verify
+network.size(consult46)
+network.edgecount(consult46)
+
+```
+
+
+# 2. Network Description
+
+```{r} 
+
+# Number of nodes
+network.size(consult46)
+
+# Number of edges
+network.edgecount(consult46)
+
+# Network statistics
+summary(consult46 ~ edges + mutual +
+          gwesp(0.5, fixed = TRUE))
+
+# Distribution of node attributes
+table(consult46 %v% "gender", useNA = "ifany")
+table(consult46 %v% "region", useNA = "ifany")
+table(consult46 %v% "orglevel", useNA = "ifany")
+
+```
+
+The original code produces a network of 41 individuals and 168 directed consultation ties. However, the dataset includes 46 employees. Five employees have no frequent consultation ties and are therefore excluded from the network constructed using the filtered edge list. I reconstructed the network to retain all 46 employees, including isolated vertices, while preserving the 168 directed ties.
+
+# 3. Initial ERGM Specification
+
+```{r} 
+#| eval: false
+
+# Testing Homophily ERGM
+set.seed(510)
+
+ergm.model <- ergm(
+  consult ~ edges + mutual +
+    gwesp(0.5, fixed = TRUE) +
+    nodematch("gender") +
+    nodematch("region") +
+    nodematch("orglevel") +
+    nodeifactor("orglevel") +
+    nodeofactor("orglevel") +
+    absdiff("orglevel"),
+  control = control.ergm(
+    MCMC.samplesize = 5000,
+    MCMC.burnin = 10000,
+    MCMLE.maxit = 10
+  ),
+  verbose = TRUE
+)
+
+summary(ergm.model)
+```
+The original ERGM estimation produced extremely large coefficients, missing standard errors, and warnings about linear dependence between model statistics, suggesting estimation instability. Therefore, the coefficients should be interpreted with caution.
+
+# 4. Interpretation of the ERGM Results
+The following questions are answered using the ERGM results provided in the exercise instructions. Since I encountered estimation difficulties when reproducing the full model, these coefficients are interpreted with caution.
+
+## Question 1. Visual Inspection of Homophily
+
+Based on the three graphs, regional homophily seems to be the most visible pattern. Employees from Europe appear to be concentrated in the upper-left part of the network, while employees from the USA are mostly located in the lower-right part. This suggests that consultation relationships may be more frequent between employees from the same region.
+
+In contrast, gender and organizational positions appear more mixed throughout the network, with no clear separation between groups. However, since the Fruchterman-Reingold algorithm positions vertices according to their connections, visual inspection alone is not sufficient to confirm homophily.
+
+## Question 2. Gender Homophily
+
+The coefficient for gender homophily is slightly positive (β = 0.1404), but it is not statistically significant (p = 0.556). Therefore, the model does not provide significant evidence of gender homophily or heterophily. In substantive terms, the results do not provide sufficient evidence that employees systematically prefer consulting colleagues of the same gender.
+
+## Question 3. Regional Homophily
+
+The coefficient for regional homophily is negative (β = -0.9278) and statistically significant (p = 0.001). This suggests regional heterophily rather than homophily. In other words, employees located in Europe and the USA appear more likely to establish consultation ties across regions than within the same region, controlling for the other terms in the model.
+
+## Question 4. Positional Homophily
+
+The coefficient for organizational-level homophily is positive (β = 1.050) and statistically significant (p = 0.014). According to the reported model, employees tend to consult colleagues occupying the same hierarchical level, suggesting positional homophily.
+
+However, this result should be interpreted cautiously because the full model presents estimation problems.
+
+## Question 5. Preferential Attachment
+
+The `nodeifactor()` terms indicate whether employees occupying certain organizational positions are more likely to receive consultation ties, compared with research assistants (the reference category).
+
+Managing consultants (level 4) have a positive and statistically significant coefficient (β = 1.721, p = 0.019). This suggests that they are more frequently consulted than research assistants, controlling for the other model terms.
+
+However, this reflects an association between organizational position and incoming ties rather than direct evidence of a dynamic preferential attachment process.
+
+## Question 6. Interpretation of nodeofactor()
+
+The `nodeofactor()` terms describe whether employees at different organizational levels are more likely to initiate consultation ties, compared with research assistants.
+
+Junior consultants (β = 1.688, p = 0.037), senior consultants (β = 3.023, p < 0.001), and managing consultants (β = 2.141, p = 0.006) have positive and statistically significant coefficients.
+
+This suggests that employees in these positions are more likely to seek advice from others. By contrast, the coefficient for partners (level 5) is not statistically significant.
+
+## Question 7. Interpretation of absdiff()
+
+The `absdiff("orglevel")` term measures the absolute difference in organizational level between two connected employees.
+
+Its coefficient is positive (β = 0.5002) and statistically significant (p = 0.002). This suggests that larger hierarchical differences are associated with a greater likelihood of consultation ties, controlling for the other effects.
+
+This does not necessarily contradict the positive homophily coefficient, since `nodematch()` captures exact similarity while `absdiff()` captures the magnitude of hierarchical differences.
+
+
+# 5. On Your Own: Homophily Based on Organizational Level
+
+I wanted to examine whether individuals are more likely to consult colleagues who occupy the same organizational level. To test this, I estimated an ERGM using the reconstructed network of 46 employees, including density (edges), reciprocity (mutual), and organizational-level homophily (nodematch).
+
+```{r}
+
+#| message: false
+#| warning: false
+#| results: hide
+
+set.seed(510)
+
+model_orglevel46 <- ergm(
+  consult46 ~ edges + mutual +
+    nodematch("orglevel")
+)
+
+summary(model_orglevel46)
+```
+
+## Interpretation
+
+The results show a positive and statistically significant effect of reciprocity (β = 4.0902, p < 0.001), suggesting that consultation relationships are more likely to be mutual. However, homophily based on organizational level has a small positive coefficient (β = 0.0578), which is not statistically significant (p = 0.692). Therefore, there is no statistically significant evidence that employees are more likely to consult colleagues occupying the same hierarchical level. These findings suggest that reciprocity plays an important role in structuring consultation relationships, while similarity in organizational position does not appear to be a significant factor in this model.
+
