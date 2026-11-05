@@ -1,0 +1,499 @@
+---
+title: "BOISDUR_exercice3"
+format: html
+editor: visual
+---
+
+# Loading the data
+
+```{r}
+# Load required packages
+pacman::p_load(
+  devtools,
+  quanteda,
+  quanteda.corpora,
+  udpipe,
+  textclean,
+  stm,
+  dplyr,
+  tidyr,
+  tidytext,
+  stringi,
+  ggplot2,
+  install = TRUE
+)
+
+# Load the UN General Debate Corpus
+data("data_corpus_ungd2017",
+     package = "quanteda.corpora")
+
+un <- data_corpus_ungd2017
+rm(data_corpus_ungd2017)
+
+# Remove missing observations
+un <- un |>
+  convert(to = "data.frame") |>
+  drop_na(continent, gdp_per_capita)
+
+# Check the number of statements
+nrow(un)
+```
+
+# Text preprocessing
+
+```{r}
+un <- un |>
+  mutate(
+    text.clean = stri_trans_general(
+      text,
+      id = "Any-Latin;Latin-ASCII"
+    ),
+    text.clean = tolower(text.clean),
+    text.clean = replace_curly_quote(text.clean),
+    text.clean = replace_contraction(text.clean),
+    text.clean = gsub("[[:digit:]]+", " ", text.clean),
+    text.clean = gsub("[[:space:]]+", " ", text.clean),
+    text.clean = trimws(text.clean)
+  )
+```
+
+# Lemmatization
+
+```{r}
+# Download and load the English language model
+eng <- udpipe_download_model(language = "english-gum")
+ud_eng <- udpipe_load_model(eng$file_model)
+
+# Annotate and lemmatize the statements
+un.df.trip <- udpipe_annotate(
+  x = un$text.clean,
+  object = ud_eng
+) |>
+  as_tibble() |>
+  anti_join(stop_words, by = c("lemma" = "word")) |>
+  select(doc_id, lemma) |>
+  filter(!grepl("[[:punct:]]+", lemma)) |>
+  count(doc_id, lemma)
+```
+
+# Document-term matrix
+
+```{r}
+# DTM
+un.dtm <- un.df.trip |>
+  cast_dfm(
+    document = doc_id,
+    term = lemma,
+    value = n
+  ) |>
+  dfm_trim(
+    min_docfreq = 0.1,
+    max_docfreq = 0.9,
+    docfreq_type = "prop"
+  )
+
+# Check the dimensions
+dim(un.dtm)
+```
+
+#Partie I : Latent Dirichlet Allocation
+## Question 1 : Estimate ten LDA models
+
+```{r}
+# Convert the DFM for topicmodels
+un_lda_dtm <- quanteda::convert(
+  un.dtm,
+  to = "topicmodels"
+)
+
+# Set seed for reproducibility
+set.seed(2026)
+
+# Define the number of topics
+k_values <- seq(2, 20, by = 2)
+
+# Estimate the ten models
+lda_models <- lapply(k_values, function(k) {
+  LDA(
+    un_lda_dtm,
+    k = k,
+    method = "Gibbs",
+    control = list(
+      seed = 2026,
+      burnin = 500,
+      iter = 1500,
+      thin = 100
+    )
+  )
+})
+
+names(lda_models) <- paste0("K", k_values)
+
+names(lda_models)
+```
+
+##Question 2 : Semantic Coherence and Exclusivity
+```{r}
+# Calculate semantic coherence and exclusivity
+
+diagnostics <- lapply(seq_along(k_values), function(i) {
+
+  model <- lda_models[[i]]
+
+  coherence <- topicdoc::topic_coherence(
+    model,
+    un_lda_dtm,
+    top_n_tokens = 10
+  )
+
+  exclusivity <- topicdoc::topic_exclusivity(
+    model,
+    top_n_tokens = 10,
+    excl_weight = 0.7
+  )
+
+  data.frame(
+    K = k_values[i],
+    semantic_coherence = mean(coherence),
+    exclusivity = mean(exclusivity)
+  )
+
+}) |>
+  dplyr::bind_rows()
+
+print(diagnostics)
+```
+```{r}
+# Plot semantic coherence and exclusivity
+
+ggplot(
+  diagnostics,
+  aes(
+    x = semantic_coherence,
+    y = exclusivity
+  )
+) +
+  geom_point(size = 3, color = "steelblue") +
+  geom_text(
+    aes(label = paste0("K = ", K)),
+    vjust = -0.8,
+    size = 3.5
+  ) +
+  labs(
+    title = "Semantic Coherence and Exclusivity of LDA Models",
+    subtitle = "UN General Debate Corpus (2017)",
+    x = "Mean Semantic Coherence",
+    y = "Mean Exclusivity"
+  ) +
+  theme_minimal()
+```
+The scatterplot reveals a trade-off between semantic coherence and exclusivity. Models with fewer topics tend to exhibit higher semantic coherence but lower exclusivity, whereas models with more topics show greater exclusivity at the expense of semantic coherence.
+
+I selected the eight-topic solution (K = 8), which provides a reasonable compromise between these two measures, with a mean semantic coherence of −24.30 and a mean exclusivity of 9.45. Compared with models containing fewer topics, it offers greater topic differentiation, while avoiding the substantial decline in semantic coherence observed in models with larger numbers of topics.
+
+##Question 3 : Topic interpretation
+```{r}
+# Retrieve the selected 8-topic model
+final_lda <- lda_models[["K8"]]
+
+# Extract topic-word probability distributions
+beta_matrix <- posterior(final_lda)$terms
+```
+
+```{r}
+# Extract the 10 most probable lemmas per topic
+
+top_lemmas <- as.data.frame(beta_matrix) |>
+  mutate(topic = row_number()) |>
+  pivot_longer(
+    cols = -topic,
+    names_to = "lemma",
+    values_to = "probability"
+  ) |>
+  group_by(topic) |>
+  slice_max(
+    order_by = probability,
+    n = 10,
+    with_ties = FALSE
+  ) |>
+  ungroup() |>
+  mutate(topic = paste0("Topic ", topic))
+
+# Display the results
+print(top_lemmas, n = 80)
+```
+```{r}
+# Visualize the 10 most probable lemmas per topic
+
+ggplot(
+  top_lemmas,
+  aes(
+    x = reorder_within(lemma, probability, topic),
+    y = probability
+  )
+) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  scale_x_reordered() +
+  facet_wrap(
+    ~ topic,
+    scales = "free",
+    ncol = 2
+  ) +
+  labs(
+    title = "Top 10 Most Probable Lemmas by Topic",
+    subtitle = "Eight-topic LDA Model - UN General Debate 2017",
+    x = "Lemma",
+    y = "Probability"
+  ) +
+  theme_minimal()
+```
+
+The eight-topic LDA model identifies several thematic dimensions within the 2017 UN General Debate speeches. Based on the ten most probable lemmas, I assigned the following labels:
+
+| Topic | Label |
+
+| Topic 1 | African Union and Regional Affairs |
+| Topic 2 | National Politics and Governance |
+| Topic 3 | Multilateral Cooperation and Institutional Reform |
+| Topic 4 | Terrorism and Humanitarian Crises |
+| Topic 5 | Human Security and Protection |
+| Topic 6 | Climate Change and Caribbean Vulnerability |
+| Topic 7 | Economic Development and Poverty Reduction |
+| Topic 8 | North Korean Nuclear Threat |
+
+Some topics are more clearly interpretable than others. Topics 6 and 8, for instance, contain highly specific vocabulary related to climate change and North Korean nuclear threats, respectively. By contrast, Topics 2, 3, and 5 contain more general terms, making their substantive interpretation less straightforward. Their labels should therefore be considered tentative.
+
+##Question 4 : Downstream Analyses
+
+The document-topic probability distributions could be used to compare diplomatic priorities across countries and continents. For instance, we could examine whether Caribbean countries devote a greater proportion of their speeches to climate change (Topic 6) than countries from other regions.
+
+These probabilities could also be used in regression analyses to investigate whether GDP per capita is associated with the prevalence of topics such as economic development and poverty reduction (Topic 7).
+
+Finally, document-topic probabilities could help identify speeches strongly associated with a particular topic, such as the North Korean nuclear threat (Topic 8), for further qualitative analysis. Topic-word probabilities could complement this analysis by identifying the vocabulary most characteristic of each topic.
+
+#Partie 2 : Structural Topic Modeling
+##Question 1 : Estimating a Six-Topic Structural Topic Model
+```{r}
+# Align metadata with the document-term matrix
+rownames(un) <- paste0("doc", 1:nrow(un))
+un <- un[rownames(un.dtm), ]
+
+# Verify alignment
+identical(rownames(un), rownames(un.dtm))
+
+# Convert the DFM to STM format
+un_stm <- quanteda::convert(
+  un.dtm,
+  to = "stm"
+)
+
+# Estimate the six-topic STM model
+set.seed(2026)
+
+un.model <- stm(
+  documents = un_stm$documents,
+  vocab = un_stm$vocab,
+  K = 6,
+  prevalence = ~ gdp_per_capita + continent,
+  data = un,
+  init.type = "Spectral",
+  seed = 2026
+)
+
+# Display the model summary
+summary(un.model)
+```
+##Question 2 : Interpreting STM Topics
+```{r}
+labelTopics(un.model)
+```
+The six-topic STM model reveals several thematic dimensions of the 2017 UN General Debate speeches. Based on the highest-probability, FREX, and lift terms, I propose the following interpretations:
+
+Topic 1 — Nuclear Security and International Conflicts. The prominence of terms such as nuclear, korea, weapon, and missile suggests a focus on nuclear proliferation and international security. The presence of ukraine and disarmament also indicates broader geopolitical tensions.
+
+Topic 2 — Middle Eastern Conflicts. Terms such as israel, palestinian, iran, occupation, and jerusalem suggest that this topic captures regional conflicts in the Middle East, particularly the Israeli-Palestinian conflict.
+
+Topic 3 — Social Welfare and Domestic Development. The combination of poverty, education, woman, child, and democracy points to socioeconomic development, social welfare, and domestic governance. However, the diversity of these terms suggests a relatively broad thematic category.
+
+Topic 4 — European and International Cooperation. The presence of european, cooperation, migration, and multilateralism suggests discussions of European affairs and international relations. References to terrorism and syrian indicate that security and migration issues may also contribute to this topic, making its interpretation less straightforward.
+
+Topic 5 — African Regional Affairs.Terms such as african, union, sahel, sudan, and libya suggest a focus on African regional politics, institutional cooperation, and political challenges across the continent.
+
+Topic 6 — Climate Change and Island Vulnerability. The prominence of climate, island, caribbean, pacific, and hurricane, alongside references to Irma and Maria, indicates a focus on climate change, natural disasters, and the particular vulnerability of island states.
+
+Overall, Topics 1, 2, 5, and 6 appear relatively well-defined, while Topics 3 and 4 contain more heterogeneous vocabulary. Their interpretation therefore requires greater caution.
+
+##Question 3 : Effects of GDP per Capita on Topic Prevalence
+
+```{r}
+# Estimate covariate effects on Topics 3 and 6
+
+library(stminsights)
+
+set.seed(2026)
+
+un.effs <- estimateEffect(
+  c(3, 6) ~ gdp_per_capita + continent,
+  stmobj = un.model,
+  metadata = un,
+  uncertainty = "Global"
+)
+
+# Display regression results
+summary(un.effs)
+```
+```{r}
+# Extract predicted topic prevalence by GDP per capita
+
+gdp.effects <- stminsights::get_effects(
+  estimates = un.effs,
+  variable = "gdp_per_capita",
+  type = "continuous"
+) |>
+  mutate(
+    Topic = case_when(
+      as.character(topic) == "3" ~
+        "Social Welfare and Domestic Development",
+      as.character(topic) == "6" ~
+        "Climate Change and Island Vulnerability"
+    )
+  ) |>
+  arrange(Topic, value)
+
+# Display the results
+head(gdp.effects)
+```
+```{r}
+# Plot predicted topic prevalence by GDP per capita
+
+ggplot(
+  gdp.effects,
+  aes(
+    x = value,
+    y = proportion,
+    color = Topic,
+    fill = Topic
+  )
+) +
+  geom_ribbon(
+    aes(ymin = lower, ymax = upper),
+    alpha = 0.15,
+    color = NA
+  ) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "GDP per Capita and Predicted Topic Prevalence",
+    subtitle = "UN General Debate Corpus (2017)",
+    x = "GDP per Capita",
+    y = "Predicted Topic Prevalence",
+    color = "Topic",
+    fill = "Topic"
+  ) +
+  theme_minimal()
+```
+
+The plot suggests different patterns in predicted topic prevalence across GDP per capita. Topic 3 (Social Welfare and Domestic Development) remains relatively stable, with a predicted prevalence of approximately 0.24. In contrast, Topic 6 (Climate Change and Island Vulnerability) shows a slight downward trend as GDP per capita increases.
+
+However, neither association is statistically significant (p = 0.940 for Topic 3 and p = 0.456 for Topic 6). The relatively wide confidence intervals, particularly at higher GDP levels, further suggest uncertainty in these estimates.
+
+Interestingly, the regression results indicate significant differences across continents. In particular, the predicted prevalence of Topic 6 is higher for countries in the Americas and Oceania compared with Africa, controlling for GDP per capita. This suggests that geographical context may be more strongly associated with the prominence of climate-related issues in UN speeches than national economic wealth.
+
+##Question 4 : Topic Prevalence Across Continents
+```{r}
+# Estimate effects for Topics 3 and 5
+
+set.seed(2026)
+
+un.effs.continent <- estimateEffect(
+  c(3, 5) ~ gdp_per_capita + continent,
+  stmobj = un.model,
+  metadata = un,
+  uncertainty = "Global"
+)
+```
+
+```{r}
+# Extract predicted topic prevalence by continent
+
+un.continent.effects <- get_effects(
+  un.effs.continent,
+  variable = "continent",
+  type = "pointestimate"
+) |>
+  mutate(Topics = case_when(
+    as.character(topic) == "5" ~ "Africa",
+    as.character(topic) == "3" ~ "National Welfare"
+  ))
+
+# Plot predicted topic prevalence
+
+un.continent.effects |>
+  ggplot(aes(x = value, y = proportion, color = value)) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    alpha = 0.5,
+    width = .5
+  ) +
+  geom_point() +
+  labs(x = "") +
+  guides(color = "none") +
+  labs(y = "Predicted Topic Prevalence") +
+  facet_wrap(~Topics)
+```
+
+The plot reveals substantial geographical differences in predicted topic prevalence.
+
+Topic 5 (Africa) is considerably more prevalent in speeches from African countries (approximately 0.47) than from other continents. This suggests that African states devote a greater proportion of their speeches to regional political and institutional issues. The relatively limited overlap between confidence intervals reinforces this geographical distinction.
+
+Topic 3 (National Welfare) displays a different pattern. Its predicted prevalence is highest in the Americas (approximately 0.29) and Africa (0.24), while Europe and Oceania exhibit substantially lower values. However, the overlapping confidence intervals indicate greater uncertainty regarding some of these differences.
+
+Overall, these results suggest that geographical context is associated with the thematic priorities expressed in UN General Debate speeches, even after accounting for GDP per capita.
+
+#On Your own
+##Question 1 : Topic Selection and Interpretation
+I selected Topic 2, which I label "Middle Eastern Conflicts and Geopolitical Tensions".
+
+The highest-probability terms, including israel, resolution, terrorism, palestinian, and humanitarian, suggest a focus on political conflicts and humanitarian issues in the Middle East. The FREX and lift terms provide a more specific interpretation, with words such as occupation, palestine, jerusalem, arab, and iran pointing particularly to the Israeli-Palestinian conflict and broader regional tensions.
+
+Overall, this topic appears to capture diplomatic discussions surrounding territorial disputes, regional security, and humanitarian challenges in the Middle East.
+
+##Question 2 : Identifying the Three Most Representative Speeches
+
+```{r}
+# Extract the three speeches with the highest Topic 2 prevalence
+top_thoughts <- findThoughts(
+  model = un.model,
+  texts = un$text,
+  topics = 2,
+  n = 3
+)
+
+# Extract document indices
+top_indices <- top_thoughts$index[[1]]
+
+# Create a summary table
+top_speeches <- data.frame(
+  Rank = 1:3,
+  Document = rownames(un)[top_indices],
+  Country = un$country[top_indices],
+  Topic_Prevalence = round(
+    un.model$theta[top_indices, 2],
+    3
+  )
+)
+
+# Display the results
+print(top_speeches)
+```
+
+##Question 3 : Reading the Three Selected UN Speeches
+```{r}
+selected_speeches <- data.frame(
+  Country = un$country[top_indices],
+  Text = un$text[top_indices]
+)
+```
+
+##Question 4 : Evaluating the Topic Label
+The label "Middle Eastern Conflicts and Geopolitical Tensions" broadly aligns with the three selected speeches. The model successfully identifies a shared focus on regional conflicts, security, and international relations. However, a closer reading reveals important differences in their political priorities. The Palestinian speech primarily focuses on Israeli occupation, sovereignty, and the two-state solution, while Saudi Arabia addresses several regional crises, including Yemen, Iran, and Qatar. The Yemeni speech emphasizes the country's internal conflict, humanitarian crisis, and reconstruction efforts. Although the model captures their common geopolitical vocabulary, it overlooks these distinct national perspectives and the specific political arguments developed by each speaker. This illustrates the limitations of topic modeling in capturing the nuances of diplomatic discourse.
