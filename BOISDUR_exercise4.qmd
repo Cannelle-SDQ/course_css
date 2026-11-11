@@ -5,6 +5,7 @@ editor: visual
 ---
 
 # Load the UN General Debate Corpus
+
 ```{r}
 library(quanteda)
 library(quanteda.corpora)
@@ -27,6 +28,7 @@ dim(un)
 ```
 
 # Text preprocessing
+
 ```{r}
 library(stringi)
 library(textclean)
@@ -52,7 +54,8 @@ substr(un$text.clean[1], 1, 200)
 
 ```
 
-#Lemmatisation
+# Lemmatisation
+
 ```{r}
 
 library(udpipe)
@@ -94,6 +97,7 @@ head(un.df.trip, 10)
 ```
 
 # Document-term matrix
+
 ```{r}
 un.dtm <- un.df.trip |>
   cast_dfm(
@@ -128,7 +132,8 @@ dim(un)
 dim(un.dtm)
 ```
 
-#Embeddings fast text
+# Embeddings fast text
+
 ```{r}
 
 library(text2map.pretrained)
@@ -149,8 +154,9 @@ dim(un.vectors)
 
 ```
 
-#Part I: Semantic Directions
-##Question 1
+# Part I: Semantic Directions
+## Question 1
+
 ```{r}
 # Load required package
 library(text2map)
@@ -188,7 +194,8 @@ policy.direction <- text2map::get_direction(
 # Check the dimensions
 dim(policy.direction)
 ```
-##Question 2
+## Question 2
+
 ```{r}
 # Calculate cosine similarity with the semantic direction
 
@@ -225,15 +232,16 @@ top_foreign <- cosine_results |>
 print(top_foreign)
 ```
 
-##Question 3
+## Question 3
+
 The semantic direction reveals an asymmetry between the two poles. Words associated with the foreign pole, such as diplomatic, delegation, envoy, and ambassador, form a relatively coherent vocabulary related to international relations and diplomacy.
 
 In contrast, the domestic pole is more heterogeneous. Although terms such as violence, abuse, and tragedy may refer to domestic challenges, other words, including ongoing, range, and capacity, are less clearly associated with domestic policy.
 
 These results suggest that the semantic direction captures the foreign policy dimension more clearly than the domestic one. However, the interpretation should remain cautious because only one pair of anchor words (domestic/foreign) was available after filtering.
 
-#Part 2: Word Mover’s Distance
-##Question 1
+# Part 2: Word Mover’s Distance
+## Question 1
 
 ```{r}
 # Load required package
@@ -268,7 +276,8 @@ dim(wmd_dis)
 wmd_dis[1:5, 1:5]
 
 ```
-##Question 2
+## Question 2
+
 ```{r}
 # Load required packages
 library(dplyr)
@@ -309,7 +318,7 @@ wmd_dis[c("United States", "China"), ] |>
     x = ""
   )
 ```
-###Additional visualization
+### Additional visualization
 
 To improve the readability of the figure, I produced an additional visualization highlighting only the five countries with the highest and lowest similarity scores for each reference country (United States and China). This adjustment reduces label overlap while preserving the original similarity scores and distributions.
 ```{r}
@@ -376,11 +385,13 @@ The countries displaying the highest similarities also differ between the two re
 
 These findings suggest that the two speeches share vocabulary and semantic content with different sets of countries. However, semantic similarity does not necessarily imply political or diplomatic agreement. Countries may discuss similar international issues while adopting different positions.
 
-#On Your Own
-##Question 1
+# On Your Own
+## Question 1
+
 Selected dimension: Economy vs. Environment
 
-##Question 2
+## Question 2
+
 ```{r}
 # Create anchor words for Economy vs. Environment
 
@@ -454,7 +465,8 @@ econ_env.direction <- text2map::get_direction(
 dim(econ_env.direction)
 ```
 
-##Question 3
+## Question 3
+
 ```{r}
 # Extract the semantic direction
 direction_econ_env <- as.numeric(econ_env.direction[1, ])
@@ -489,7 +501,8 @@ top_environment <- cosine_results_econ_env |>
 
 print(top_environment)
 ```
-##Question 4
+## Question 4
+
 I chose to construct a semantic direction contrasting economy and environment, as both dimensions are central to international discussions on development and sustainability. For the economic pole, I selected economy, growth, investment, trade, and industry. For the environmental pole, I selected climate, environment, biodiversity, conservation, and sustainability.
 
 The results reveal two relatively coherent semantic fields. The economic pole is associated with terms such as market, sector, employment, and business, suggesting a focus on economic activity, production, and employment. In contrast, the environmental pole includes words such as environmental, warming, earth, and science, reflecting concerns related to climate change and environmental protection.

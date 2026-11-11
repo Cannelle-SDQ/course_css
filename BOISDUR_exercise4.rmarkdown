@@ -1,0 +1,510 @@
+---
+title: "BOISDUR_exercise4"
+format: docx
+editor: visual
+---
+
+# Load the UN General Debate Corpus
+
+```{r}
+library(quanteda)
+library(quanteda.corpora)
+library(dplyr)
+library(tidyr)
+
+data("data_corpus_ungd2017",
+     package = "quanteda.corpora")
+
+un <- data_corpus_ungd2017
+rm(data_corpus_ungd2017)
+
+# Remove missing observations
+un <- un |>
+  convert(to = "data.frame") |>
+  drop_na(continent, gdp_per_capita)
+
+# Check the number of statements
+dim(un)
+```
+
+# Text preprocessing
+
+```{r}
+library(stringi)
+library(textclean)
+library(dplyr)
+
+un <- un |>
+  mutate(
+    text.clean = stri_trans_general(
+      text,
+      id = "Any-Latin;Latin-ASCII"
+    ),
+    text.clean = tolower(text.clean),
+    text.clean = replace_curly_quote(text.clean),
+    text.clean = replace_contraction(text.clean),
+    text.clean = gsub("[[:digit:]]+", " ", text.clean),
+    text.clean = gsub("[[:space:]]+", " ", text.clean),
+    text.clean = trimws(text.clean)
+  )
+
+# Check the results
+dim(un)
+substr(un$text.clean[1], 1, 200)
+
+```
+
+# Lemmatisation
+
+```{r}
+
+library(udpipe)
+library(tidytext)
+library(dplyr)
+
+# Find an existing English model
+model_files <- list.files(
+  pattern = "^english-gum.*\\.udpipe$",
+  full.names = TRUE
+)
+
+# Download the model only if necessary
+if (length(model_files) == 0) {
+  eng <- udpipe_download_model(language = "english-gum")
+  model_file <- eng$file_model
+} else {
+  model_file <- model_files[1]
+}
+
+# Load the model
+ud_eng <- udpipe_load_model(model_file)
+
+
+# Lemmatization
+un.df.trip <- udpipe_annotate(
+  x = un$text.clean,
+  object = ud_eng
+) |>
+  as_tibble() |>
+  anti_join(stop_words, by = c("lemma" = "word")) |>
+  select(doc_id, lemma) |>
+  filter(!grepl("[[:punct:]]+", lemma)) |>
+  count(doc_id, lemma)
+  
+  
+dim(un.df.trip)
+head(un.df.trip, 10)
+```
+
+# Document-term matrix
+
+```{r}
+un.dtm <- un.df.trip |>
+  cast_dfm(
+    document = doc_id,
+    term = lemma,
+    value = n
+  ) |>
+  dfm_trim(
+    min_docfreq = 0.1,
+    max_docfreq = 0.9,
+    docfreq_type = "prop"
+  )
+
+# Check dimensions
+dim(un.dtm)
+```
+```{r}
+# Align metadata with the document-term matrix
+rownames(un) <- paste0("doc", 1:nrow(un))
+
+un <- un[rownames(un.dtm), ]
+
+# Verify alignment
+identical(rownames(un), rownames(un.dtm))
+```
+```{r}
+# Check document identifiers
+head(un$doc_id)
+
+# Check dimensions
+dim(un)
+dim(un.dtm)
+```
+
+# Embeddings fast text
+
+```{r}
+
+library(text2map.pretrained)
+
+
+# Load pretrained fastText embeddings
+wv <- text2map.pretrained::load_pretrained(
+  "vecs_fasttext300_commoncrawl"
+)
+
+# Keep only vectors corresponding to DTM lemmas
+un.vectors <- wv[
+  rownames(wv) %in% colnames(un.dtm),
+]
+
+
+dim(un.vectors)
+
+```
+
+# Part I: Semantic Directions
+## Question 1
+
+```{r}
+# Load required package
+library(text2map)
+library(dplyr)
+
+# Retrieve policy anchor words
+anchors <- text2map::get_anchors("policy")
+
+# Display the first anchor pairs
+head(anchors)
+
+```
+
+```{r}
+# Keep only anchor pairs available in the embeddings
+anchors <- anchors[
+  anchors$pole1 %in% rownames(un.vectors),
+]
+
+anchors <- anchors[
+  anchors$pole2 %in% rownames(un.vectors),
+]
+
+# Check remaining anchor pairs
+anchors
+```
+
+```{r}
+# Construct the policy semantic direction
+policy.direction <- text2map::get_direction(
+  anchors = anchors,
+  wv = un.vectors
+)
+
+# Check the dimensions
+dim(policy.direction)
+```
+## Question 2
+
+```{r}
+# Calculate cosine similarity with the semantic direction
+
+direction <- as.numeric(policy.direction[1, ])
+
+cosine_scores <- as.numeric(
+  un.vectors %*% direction
+) / (
+  sqrt(rowSums(un.vectors^2)) *
+  sqrt(sum(direction^2))
+)
+
+# Create a data frame with lemmas and cosine scores
+
+cosine_results <- data.frame(
+  lemma = rownames(un.vectors),
+  cosine = cosine_scores
+)
+```
+
+```{r}
+# Top 10 words closest to the domestic pole
+top_domestic <- cosine_results |>
+  arrange(desc(cosine)) |>
+  head(10)
+
+print(top_domestic)
+
+# Top 10 words closest to the foreign pole
+top_foreign <- cosine_results |>
+  arrange(cosine) |>
+  head(10)
+
+print(top_foreign)
+```
+
+## Question 3
+
+The semantic direction reveals an asymmetry between the two poles. Words associated with the foreign pole, such as diplomatic, delegation, envoy, and ambassador, form a relatively coherent vocabulary related to international relations and diplomacy.
+
+In contrast, the domestic pole is more heterogeneous. Although terms such as violence, abuse, and tragedy may refer to domestic challenges, other words, including ongoing, range, and capacity, are less clearly associated with domestic policy.
+
+These results suggest that the semantic direction captures the foreign policy dimension more clearly than the domestic one. However, the interpretation should remain cautious because only one pair of anchor words (domestic/foreign) was available after filtering.
+
+# Part 2: Word Mover’s Distance
+## Question 1
+
+```{r}
+# Load required package
+library(text2vec)
+
+# Identify vocabulary covered by the embeddings
+vocab <- rownames(un.vectors)
+
+# Restrict the DTM to the available vocabulary
+un.dtm.wmd <- un.dtm[, vocab]
+
+# Assign country names to the rows
+rownames(un.dtm.wmd) <- un$doc_id
+
+# Check dimensions
+dim(un.dtm.wmd)
+```
+```{r}
+# Create the RWMD model
+wmd_mod <- RWMD$new(
+  x = un.dtm.wmd,
+  embeddings = un.vectors
+)
+
+# Compute document similarities
+wmd_dis <- wmd_mod$sim2(x = un.dtm.wmd)
+
+# Check dimensions
+dim(wmd_dis)
+
+# Display a subset of the similarity matrix
+wmd_dis[1:5, 1:5]
+
+```
+## Question 2
+
+```{r}
+# Load required packages
+library(dplyr)
+library(tibble)
+library(reshape2)
+library(ggplot2)
+library(ggrepel)
+
+# Visualize similarities to the United States and China
+wmd_dis[c("United States", "China"), ] |>
+  t() |>
+  as.data.frame() |>
+  rownames_to_column(var = "country") |>
+  reshape2::melt() |>
+  filter(
+    !(country == "United States" & variable == "United States") &
+    !(country == "China" & variable == "China")
+  ) |>
+  group_by(variable) |>
+  mutate(
+    label = ifelse(
+      value >= quantile(value, .9) |
+      value <= quantile(value, .1),
+      country,
+      NA
+    )
+  ) |>
+  ungroup() |>
+  ggplot(aes(x = variable, y = value)) +
+  geom_boxplot(outlier.shape = NA, alpha = .3) +
+  geom_text_repel(
+    aes(label = label),
+    alpha = .5,
+    max.overlaps = Inf
+  ) +
+  labs(
+    y = "Word Mover's Distance",
+    x = ""
+  )
+```
+### Additional visualization
+
+To improve the readability of the figure, I produced an additional visualization highlighting only the five countries with the highest and lowest similarity scores for each reference country (United States and China). This adjustment reduces label overlap while preserving the original similarity scores and distributions.
+```{r}
+
+# Prepare data for visualization
+wmd_plot <- wmd_dis[c("United States", "China"), ] |>
+  t() |>
+  as.data.frame() |>
+  tibble::rownames_to_column(var = "country") |>
+  reshape2::melt(
+    id.vars = "country",
+    variable.name = "reference_country"
+  ) |>
+  filter(
+    !(country == "United States" &
+        reference_country == "United States"),
+    !(country == "China" &
+        reference_country == "China")
+  ) |>
+  group_by(reference_country) |>
+  mutate(
+    rank_high = min_rank(desc(value)),
+    rank_low = min_rank(value),
+    label = ifelse(
+      rank_high <= 5 | rank_low <= 5,
+      country,
+      NA_character_
+    )
+  ) |>
+  ungroup()
+
+# Plot
+
+#| fig-width: 11
+#| fig-height: 7
+#| fig-align: center
+
+ggplot(wmd_plot,
+       aes(x = reference_country, y = value)) +
+  geom_boxplot(
+    fill = "mediumpurple3",
+    alpha = 0.3,
+    width = 0.45,
+    outlier.shape = NA
+  ) +
+  ggrepel::geom_text_repel(
+    aes(label = label),
+    na.rm = TRUE,
+    max.overlaps = Inf,
+    size = 3,
+    box.padding = 0.5
+  ) +
+  labs(
+    title = "Semantic Similarity to US and Chinese UN Speeches",
+    subtitle = "UN General Debate Corpus, 2017",
+    x = "",
+    y = "RWMD Similarity Score"
+  ) +
+  theme_minimal(base_size = 12)
+```
+The figure shows that the United States generally has higher semantic similarity scores with other countries' UN General Debate statements than China. The median similarity is approximately 0.79 for the United States, compared with 0.75 for China.
+
+The countries displaying the highest similarities also differ between the two reference countries. For instance, Czechia and Israel appear among the most similar to the United States, whereas South Korea, Japan, and Vietnam show high similarity scores with China.
+
+These findings suggest that the two speeches share vocabulary and semantic content with different sets of countries. However, semantic similarity does not necessarily imply political or diplomatic agreement. Countries may discuss similar international issues while adopting different positions.
+
+# On Your Own
+## Question 1
+
+Selected dimension: Economy vs. Environment
+
+## Question 2
+
+```{r}
+# Create anchor words for Economy vs. Environment
+
+anchors_econ_env <- data.frame(
+  pole1 = c(
+    "economy",
+    "growth",
+    "investment",
+    "trade",
+    "industry"
+  ),
+  pole2 = c(
+    "climate",
+    "environment",
+    "biodiversity",
+    "pollution",
+    "sustainability"
+  )
+)
+
+# Display the anchor pairs
+anchors_econ_env
+```
+
+```{r}
+# Check availability of anchor words
+
+anchors_econ_env |>
+  mutate(
+    pole1_available = pole1 %in% rownames(un.vectors),
+    pole2_available = pole2 %in% rownames(un.vectors)
+  )
+```
+```{r}
+# Check alternative environmental anchor words
+
+alternatives <- c(
+  "conservation",
+  "emission",
+  "ecosystem"
+)
+
+data.frame(
+  word = alternatives,
+  available = alternatives %in% rownames(un.vectors)
+)
+```
+
+```{r}
+# Replace pollution with conservation
+anchors_econ_env$pole2[
+  anchors_econ_env$pole2 == "pollution"
+] <- "conservation"
+
+# Keep only anchor pairs available in the embeddings
+anchors_econ_env <- anchors_econ_env[
+  anchors_econ_env$pole1 %in% rownames(un.vectors) &
+  anchors_econ_env$pole2 %in% rownames(un.vectors),
+]
+
+# Check the final anchor list
+anchors_econ_env
+
+# Construct the Economy vs. Environment semantic direction
+econ_env.direction <- text2map::get_direction(
+  anchors = anchors_econ_env,
+  wv = un.vectors
+)
+
+# Check dimensions
+dim(econ_env.direction)
+```
+
+## Question 3
+
+```{r}
+# Extract the semantic direction
+direction_econ_env <- as.numeric(econ_env.direction[1, ])
+
+# Calculate cosine similarities
+cosine_scores_econ_env <- as.numeric(
+  un.vectors %*% direction_econ_env
+) / (
+  sqrt(rowSums(un.vectors^2)) *
+  sqrt(sum(direction_econ_env^2))
+)
+
+# Create a data frame with lemmas and cosine scores
+cosine_results_econ_env <- data.frame(
+  lemma = rownames(un.vectors),
+  cosine = cosine_scores_econ_env
+)
+```
+
+```{r}
+# Top 10 lemmas closest to the Economy pole
+top_economy <- cosine_results_econ_env |>
+  arrange(desc(cosine)) |>
+  head(10)
+
+print(top_economy)
+
+# Top 10 lemmas closest to the Environment pole
+top_environment <- cosine_results_econ_env |>
+  arrange(cosine) |>
+  head(10)
+
+print(top_environment)
+```
+## Question 4
+
+I chose to construct a semantic direction contrasting economy and environment, as both dimensions are central to international discussions on development and sustainability. For the economic pole, I selected economy, growth, investment, trade, and industry. For the environmental pole, I selected climate, environment, biodiversity, conservation, and sustainability.
+
+The results reveal two relatively coherent semantic fields. The economic pole is associated with terms such as market, sector, employment, and business, suggesting a focus on economic activity, production, and employment. In contrast, the environmental pole includes words such as environmental, warming, earth, and science, reflecting concerns related to climate change and environmental protection.
+
+However, the economic pole shows stronger cosine scores than the environmental pole. This difference should be interpreted cautiously, as the scores measure semantic associations rather than the frequency or importance of these issues in UN speeches. Furthermore, economy and environment are not necessarily opposing policy objectives, particularly in discussions of sustainable development.
