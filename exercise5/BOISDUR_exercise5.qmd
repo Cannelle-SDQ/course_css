@@ -1,0 +1,510 @@
+---
+title: "BOISDUR_exercise5"
+editor: visual
+format:
+  docx:
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Objective and data
+
+The objective of this exercise is to predict satisfaction with the way democracy works in a respondent's country, using data from the European Social Survey (ESS), rounds 9, 10, and 11. The outcome, `stfdem_bin`, equals 1 when the original satisfaction score is 6–10 and 0 when it is 0–5. Refusals, "don't know" answers and non-responses are excluded from the labelled observations.
+
+The supplied extract contains 137,246 observations. The file `train_validate_ess.csv` contains 96,072 rows, of which 92,962 have a known outcome. The file `test_ess.csv` contains 41,174 rows with the outcome withheld. I use an 80/20 split of the labelled observations for model development and validation, with five-fold cross-validation inside the training portion. The performance measure of interest is the F1-score for class 1 (satisfied respondents), rather than classification accuracy alone.
+
+The analysis below reproduces the four models I tried and the final CSV of test-set predictions. The original CSV files should be in the same directory as this Quarto document. Required R packages are `tidyverse`, `tidymodels`, `glmnet`, and `xgboost` (installed beforehand, if necessary).
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(tidymodels)
+library(glmnet)
+library(xgboost)
+
+set.seed(123)
+```
+
+## Import and initial inspection
+
+```{r}
+#| label: import-data
+train_validate <- read_csv("train_validate_ess.csv", show_col_types = FALSE)
+test_ess <- read_csv("test_ess.csv", show_col_types = FALSE)
+
+stopifnot(identical(names(train_validate), names(test_ess)))
+
+tibble(
+  dataset = c("Training/validation file", "Competition test file"),
+  observations = c(nrow(train_validate), nrow(test_ess)),
+  variables = c(ncol(train_validate), ncol(test_ess))
+)
+
+train_validate %>%
+  count(stfdem_bin, name = "n") %>%
+  mutate(percentage = round(100 * n / sum(n), 2))
+```
+
+An important data-quality issue is that many ESS variables use numeric non-response codes, rather than actual `NA` values. For instance, 77/88/99 denote refusal, "don't know" and no answer on 0–10 scales; on some 1–5 or 1–4 items, the corresponding codes are 7/8/9. I checked these codes against the supplied ESS codebook and recoded the selected variables accordingly. Other variables, particularly country-specific political-party items, have extensive structural missingness and are not used in the models reported here. The unnamed import column `...1` is removed, and `idno` is kept for matching rather than used as a predictor.
+
+# Data preparation
+
+## Cleaning selected predictors
+
+The first model uses nine predictors. The extended models use 23 predictors, covering institutional trust, political attitudes, satisfaction with public services, general well-being, country, and ESS round. This is a focused feature-selection strategy rather than a search over all available variables.
+
+```{r}
+#| label: cleaning
+# Initial seven substantive predictors
+vars_0_10 <- c("stfgov", "stfeco", "trstprl", "trstplt")
+vars_low <- c("polintr", "psppsgva", "hincfel")
+
+# Fourteen additional predictors for the extended models
+new_vars_0_10 <- c(
+  "trstprt", "trstlgl", "trstplc", "trstep", "trstun",
+  "stfedu", "stfhlth", "stflife", "happy", "ppltrst",
+  "pplfair", "pplhlp", "lrscale"
+)
+new_vars_low <- "psppipla"
+
+predictors <- c(vars_0_10, vars_low, "cntry", "essround")
+predictors_v2 <- c(predictors, new_vars_0_10, new_vars_low)
+
+clean_ess <- function(data) {
+  data %>%
+    mutate(
+      across(
+        all_of(c(vars_0_10, new_vars_0_10)),
+        ~ replace(.x, .x %in% c(77, 88, 99), NA_real_)
+      ),
+      across(
+        all_of(c(vars_low, new_vars_low)),
+        ~ replace(.x, .x %in% c(7, 8, 9), NA_real_)
+      )
+    ) %>%
+    select(-any_of("...1"))
+}
+
+train_clean <- clean_ess(train_validate)
+test_clean <- clean_ess(test_ess)
+
+# Inspect missingness in the selected additional variables
+train_clean %>%
+  summarise(across(all_of(c(new_vars_0_10, new_vars_low)),
+                   ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "missing") %>%
+  arrange(desc(missing)) %>%
+  print(n = 14)
+```
+
+I retained missing predictor values and used median imputation, estimated separately inside each training fold through `recipes`. I treated country and survey round as categorical variables. Their levels are converted to dummy variables, and zero-variance columns are removed. All preprocessing steps are learned from the training data and then applied to validation or test observations, which avoids leakage from outcome information.
+
+## Training and validation split
+
+```{r}
+#| label: data-split
+labelled <- train_clean %>%
+  filter(!is.na(stfdem_bin)) %>%
+  mutate(stfdem_bin = factor(stfdem_bin, levels = c(0, 1)))
+
+set.seed(123)
+ess_split <- initial_split(labelled, prop = 0.80, strata = stfdem_bin)
+train_data <- training(ess_split)
+valid_data <- testing(ess_split)
+
+make_model_data <- function(data, selected_predictors) {
+  data %>%
+    select(stfdem_bin, all_of(selected_predictors)) %>%
+    mutate(cntry = factor(cntry), essround = factor(essround))
+}
+
+train_model <- make_model_data(train_data, predictors)
+valid_model <- make_model_data(valid_data, predictors)
+train_model_v2 <- make_model_data(train_data, predictors_v2)
+valid_model_v2 <- make_model_data(valid_data, predictors_v2)
+
+# Five folds for out-of-fold predictions and threshold selection
+set.seed(123)
+cv_folds <- vfold_cv(train_model, v = 5, strata = stfdem_bin)
+set.seed(123)
+cv_folds_v2 <- vfold_cv(train_model_v2, v = 5, strata = stfdem_bin)
+
+tibble(
+  split = c("Training", "Validation"),
+  n = c(nrow(train_data), nrow(valid_data)),
+  share_class_1 = c(mean(train_data$stfdem_bin == "1"),
+                    mean(valid_data$stfdem_bin == "1"))
+)
+```
+
+The stratified split contains 74,369 training observations and 18,593 validation observations. Both have approximately 47.2% positive outcomes. The validation set is not used to estimate imputation values or fit any model. The decision threshold is selected from out-of-fold predictions on the training sample.
+
+## Evaluation functions
+
+The decision rule is to predict class 1 if its estimated probability is at least a chosen threshold. The F1-score is the harmonic mean of precision and recall. I evaluate class 1 explicitly by setting `event_level = "second"`.
+
+```{r}
+#| label: evaluation-functions
+thresholds <- seq(0.30, 0.70, by = 0.02)
+
+find_threshold <- function(cv_predictions, candidate_thresholds = thresholds) {
+  tibble(
+    threshold = candidate_thresholds,
+    f1 = vapply(candidate_thresholds, function(cutoff) {
+      pred_class <- factor(
+        if_else(cv_predictions$.pred_1 >= cutoff, 1L, 0L),
+        levels = c(0, 1)
+      )
+      f_meas_vec(
+        truth = cv_predictions$stfdem_bin,
+        estimate = pred_class,
+        event_level = "second"
+      )
+    }, numeric(1))
+  )
+}
+
+score_validation <- function(fitted_workflow, data, cutoff) {
+  predictions <- predict(fitted_workflow, new_data = data, type = "prob") %>%
+    bind_cols(data %>% select(stfdem_bin)) %>%
+    mutate(
+      predicted_class = factor(
+        if_else(.pred_1 >= cutoff, 1L, 0L), levels = c(0, 1)
+      )
+    )
+  results <- metric_set(accuracy, precision, recall, f_meas)(
+    predictions,
+    truth = stfdem_bin,
+    estimate = predicted_class,
+    event_level = "second"
+  )
+  list(predictions = predictions, metrics = results)
+}
+
+extract_metric <- function(evaluation, name) {
+  evaluation$metrics %>%
+    filter(.metric == name) %>%
+    pull(.estimate)
+}
+```
+
+# Model 1: baseline logistic regression (9 predictors)
+
+I started with a simple, interpretable logistic regression, including satisfaction with government and the economy, institutional trust, political interest, perceptions of political influence, perceived income adequacy, country, and ESS round.
+
+```{r}
+#| label: baseline-logistic
+log_recipe <- recipe(stfdem_bin ~ ., data = train_model) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+log_model <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+log_workflow <- workflow() %>%
+  add_recipe(log_recipe) %>%
+  add_model(log_model)
+
+log_fit <- fit(log_workflow, data = train_model)
+
+set.seed(123)
+cv_results <- fit_resamples(
+  log_workflow,
+  resamples = cv_folds,
+  control = control_resamples(save_pred = TRUE)
+)
+cv_preds <- collect_predictions(cv_results)
+threshold_scores <- find_threshold(cv_preds)
+best_threshold <- threshold_scores %>%
+  slice_max(f1, n = 1, with_ties = FALSE)
+
+log_validation_05 <- score_validation(log_fit, valid_model, 0.50)
+log_validation <- score_validation(log_fit, valid_model,
+                                   best_threshold$threshold[1])
+
+best_threshold
+bind_rows(
+  tibble(threshold = 0.50,
+         f1_validation = extract_metric(log_validation_05, "f_meas")),
+  tibble(threshold = best_threshold$threshold[1],
+         f1_validation = extract_metric(log_validation, "f_meas"))
+)
+```
+
+The default threshold of 0.50 produced a validation F1-score of approximately 0.7880. Choosing the threshold by five-fold cross-validation improved the validation F1-score to 0.7935 at a threshold of 0.44. Lowering the threshold increased recall but also increased false positives, illustrating the precision–recall trade-off.
+
+# Model 2: extended logistic regression (23 predictors)
+
+Next, I added 14 variables covering trust in additional institutions, opinions about public services, happiness and life satisfaction, generalized social trust, left–right self-placement, and perceived political influence. The purpose was to test whether richer attitudinal information improved predictions while retaining the same model family.
+
+```{r}
+#| label: extended-logistic
+log_recipe_v2 <- recipe(stfdem_bin ~ ., data = train_model_v2) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+log_workflow_v2 <- workflow() %>%
+  add_recipe(log_recipe_v2) %>%
+  add_model(log_model)
+
+log_fit_v2 <- fit(log_workflow_v2, data = train_model_v2)
+
+set.seed(123)
+cv_results_v2 <- fit_resamples(
+  log_workflow_v2,
+  resamples = cv_folds_v2,
+  control = control_resamples(save_pred = TRUE)
+)
+cv_preds_v2 <- collect_predictions(cv_results_v2)
+threshold_scores_v2 <- find_threshold(cv_preds_v2)
+best_threshold_v2 <- threshold_scores_v2 %>%
+  slice_max(f1, n = 1, with_ties = FALSE)
+
+log_validation_v2 <- score_validation(
+  log_fit_v2, valid_model_v2, best_threshold_v2$threshold[1]
+)
+best_threshold_v2
+log_validation_v2$metrics
+```
+
+With 23 predictors, the best cross-validated F1-score was about 0.8075; on the separate validation split it was 0.8043 at a threshold of 0.44. Adding variables had a larger effect than threshold optimization alone.
+
+# Model 3: LASSO-penalized logistic regression
+
+I then tested LASSO regression with the same 23 predictors to see whether coefficient shrinkage and variable selection would help. The penalized model uses standardized numeric inputs. I compared nine penalty values using five-fold cross-validated ROC AUC, then optimized the F1 threshold from the corresponding out-of-fold predictions.
+
+```{r}
+#| label: lasso-model
+lasso_recipe <- recipe(stfdem_bin ~ ., data = train_model_v2) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+lasso_model <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+lasso_workflow <- workflow() %>%
+  add_recipe(lasso_recipe) %>%
+  add_model(lasso_model)
+
+lasso_grid <- tibble(penalty = 10^seq(-4, 0, length.out = 9))
+
+set.seed(123)
+lasso_results <- tune_grid(
+  lasso_workflow,
+  resamples = cv_folds_v2,
+  grid = lasso_grid,
+  metrics = metric_set(roc_auc),
+  control = control_grid(save_pred = TRUE)
+)
+
+best_penalty <- select_best(lasso_results, metric = "roc_auc")
+cv_preds_lasso <- collect_predictions(
+  lasso_results,
+  parameters = best_penalty %>% select(penalty)
+)
+threshold_scores_lasso <- find_threshold(cv_preds_lasso)
+best_threshold_lasso <- threshold_scores_lasso %>%
+  slice_max(f1, n = 1, with_ties = FALSE)
+
+lasso_final_workflow <- finalize_workflow(lasso_workflow, best_penalty)
+lasso_fit <- fit(lasso_final_workflow, data = train_model_v2)
+lasso_validation <- score_validation(
+  lasso_fit, valid_model_v2, best_threshold_lasso$threshold[1]
+)
+
+best_penalty
+best_threshold_lasso
+lasso_validation$metrics
+```
+
+LASSO selected a very small penalty (0.0001) and reached a cross-validated ROC AUC of about 0.8956. Its cross-validated F1-score was 0.8077, and its validation F1-score was 0.8039, nearly indistinguishable from, and slightly below, the extended ordinary logistic model. Penalization did not bring a meaningful gain in this particular configuration.
+
+# Model 4: gradient boosting with XGBoost
+
+Finally, I tried gradient-boosted decision trees with the same 23 predictors. Unlike the additive logistic specifications, tree boosting can capture non-linear relationships and interactions without explicitly including those terms. I used 300 trees, maximum depth 4, learning rate 0.05, minimum node size 20, and an 80% row subsample. These were initial settings, not the result of an exhaustive hyperparameter search.
+
+```{r}
+#| label: xgboost-model
+xgb_recipe <- recipe(stfdem_bin ~ ., data = train_model_v2) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+xgb_model <- boost_tree(
+  trees = 300,
+  tree_depth = 4,
+  learn_rate = 0.05,
+  min_n = 20,
+  loss_reduction = 0,
+  sample_size = 0.8
+) %>%
+  set_engine("xgboost", nthread = 2, verbose = 0) %>%
+  set_mode("classification")
+
+xgb_workflow <- workflow() %>%
+  add_recipe(xgb_recipe) %>%
+  add_model(xgb_model)
+
+set.seed(123)
+xgb_cv_results <- fit_resamples(
+  xgb_workflow,
+  resamples = cv_folds_v2,
+  metrics = metric_set(roc_auc),
+  control = control_resamples(save_pred = TRUE)
+)
+xgb_cv_preds <- collect_predictions(xgb_cv_results)
+xgb_threshold_scores <- find_threshold(xgb_cv_preds)
+best_threshold_xgb <- xgb_threshold_scores %>%
+  slice_max(f1, n = 1, with_ties = FALSE)
+
+set.seed(123)
+xgb_fit <- fit(xgb_workflow, data = train_model_v2)
+xgb_validation <- score_validation(
+  xgb_fit, valid_model_v2, best_threshold_xgb$threshold[1]
+)
+
+collect_metrics(xgb_cv_results)
+best_threshold_xgb
+xgb_validation$metrics
+```
+
+XGBoost reached a cross-validated ROC AUC of approximately 0.9034 and a best cross-validated F1-score of 0.8147 at a threshold of 0.40. On the validation split, its F1-score was 0.8112, with 81.47% accuracy, 78.15% precision, and 84.31% recall. Thus, among the four candidate models, XGBoost produced the highest observed validation F1-score.
+
+```{r}
+#| label: threshold-chart
+xgb_threshold_scores %>%
+  ggplot(aes(threshold, f1)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.6) +
+  labs(
+    title = "XGBoost: cross-validated F1-score by classification threshold",
+    x = "Probability threshold",
+    y = "F1-score (class 1)"
+  ) +
+  theme_minimal()
+```
+
+# Comparison and selection
+
+The table below is generated from the fitted workflows and their predictions, rather than from manually entered results. All F1-scores use the same positive class, and validation scores use the same 18,593 held-out observations.
+
+```{r}
+#| label: comparison-table
+comparison <- tibble(
+  model = c(
+    "Logistic regression — 9 predictors",
+    "Logistic regression — 23 predictors",
+    "LASSO — 23 predictors",
+    "XGBoost — 23 predictors"
+  ),
+  threshold = c(
+    best_threshold$threshold[1],
+    best_threshold_v2$threshold[1],
+    best_threshold_lasso$threshold[1],
+    best_threshold_xgb$threshold[1]
+  ),
+  f1_cross_validated = c(
+    best_threshold$f1[1],
+    best_threshold_v2$f1[1],
+    best_threshold_lasso$f1[1],
+    best_threshold_xgb$f1[1]
+  ),
+  f1_validation = c(
+    extract_metric(log_validation, "f_meas"),
+    extract_metric(log_validation_v2, "f_meas"),
+    extract_metric(lasso_validation, "f_meas"),
+    extract_metric(xgb_validation, "f_meas")
+  )
+) %>%
+  mutate(across(starts_with("f1_"), ~ round(.x, 4))) %>%
+  arrange(desc(f1_validation))
+
+knitr::kable(comparison, caption = "F1-score comparison of candidate models")
+
+conf_mat(
+  xgb_validation$predictions,
+  truth = stfdem_bin,
+  estimate = predicted_class
+)
+```
+
+Model choice. I selected XGBoost with 23 predictors and a probability threshold of 0.40, based on its superior F1-score in both the five-fold results and the separate validation sample. These are estimates of predictive performance, not causal effects of political attitudes on democratic satisfaction. Moreover, because the same validation sample was inspected while comparing model families, the reported winning validation score may be somewhat optimistic. No target values from the competition test set were used in model selection.
+
+# Final fit and competition predictions
+
+Once the model architecture and threshold were selected, I refitted XGBoost using all 92,962 labelled observations. The model generates probabilities for each of the 41,174 rows of `test_ess.csv`, which I binarize using the fixed threshold of 0.40. The submission includes `idno`, as required. Because `idno` alone repeats across ESS countries/rounds, I also include `cntry` and `essround` to support an unambiguous match by the combined key.
+
+```{r}
+#| label: final-predictions
+full_model_v2 <- make_model_data(labelled, predictors_v2)
+test_model_v2 <- make_model_data(test_clean, predictors_v2) %>%
+  select(-stfdem_bin)
+
+set.seed(123)
+xgb_final_fit <- fit(xgb_workflow, data = full_model_v2)
+final_threshold <- best_threshold_xgb$threshold[1]
+
+final_probabilities <- predict(
+  xgb_final_fit,
+  new_data = test_model_v2,
+  type = "prob"
+)
+
+predictions_finales <- test_clean %>%
+  select(cntry, essround, idno) %>%
+  mutate(
+    stfdem_bin = if_else(
+      final_probabilities$.pred_1 >= final_threshold,
+      1L, 0L
+    )
+  )
+
+stopifnot(
+  nrow(predictions_finales) == nrow(test_ess),
+  !anyNA(predictions_finales$stfdem_bin),
+  all(predictions_finales$stfdem_bin %in% c(0L, 1L)),
+  !anyDuplicated(predictions_finales[c("cntry", "essround", "idno")])
+)
+
+write_csv(predictions_finales, "BOISDUR_predictions.csv")
+
+tibble(
+  rows_exported = nrow(predictions_finales),
+  predicted_0 = sum(predictions_finales$stfdem_bin == 0),
+  predicted_1 = sum(predictions_finales$stfdem_bin == 1),
+  duplicate_idno = sum(duplicated(predictions_finales$idno)),
+  duplicate_composite_key = sum(duplicated(
+    predictions_finales[c("cntry", "essround", "idno")]
+  ))
+)
+```
+
+# Trial-and-error narrative and challenges
+
+I began with an interpretable logistic regression and nine predictors selected from the ESS codebook. This first model performed reasonably well, with a validation F1-score of 0.7880 at the standard threshold of 0.50. I then experimented with threshold optimization. Five-fold cross-validation suggested using 0.44, which raised the separate validation F1-score to 0.7935. This taught me that the probability threshold matters when the evaluation criterion is F1 rather than accuracy.
+
+Next, I enriched the specification with 14 additional variables relating to institutional trust, satisfaction with public services, political attitudes, and general well-being. The extended logistic regression clearly outperformed the initial one, reaching a validation F1-score of 0.8043. I interpreted this as evidence that the added variables provide useful predictive information, without assuming that their effects are causal.
+
+I then tested a LASSO-penalized logistic regression to reduce potential redundancy among correlated attitudinal measures. The selected penalty was very small (0.0001), and the validation F1-score was 0.8039. Thus, in this experiment, regularization did not improve performance over the unpenalized extended logistic regression. Finally, I tested XGBoost using the same 23 predictors. It achieved the highest observed validation F1-score, 0.8112, after setting the classification threshold to 0.40 based on cross-validated predictions. Its flexibility to model non-linearities and interactions is a plausible reason for the improvement, although I did not directly test that mechanism.
+
+The main practical difficulty was data cleaning. In the ESS data, special numeric codes represent refusal, "don't know", or no answer; these would have been mistakenly interpreted as high scores if left unchanged. Several country-specific variables also have over 99% missing values and were not useful for this focused specification. I addressed remaining predictor missingness with median imputation inside the resampling workflow, rather than deleting large numbers of observations. I also discovered that `idno` is not unique in the pooled extract: 12,020 rows of the test file share an `idno` with an earlier row. The combination of country, ESS round, and `idno` is unique in the competition test file, so I included all three identifiers in the submission CSV.
+
+Overall, the largest gains came from expanding the feature set and moving from linear logistic specifications to tree boosting. LASSO did not bring a meaningful gain. The main limitations are that I tested a focused subset of the available variables, did not exhaustively tune XGBoost hyperparameters, and compared several candidates using the same held-out validation sample. Therefore, the true competition test-set F1-score remains unknown until the instructor evaluates the predictions.

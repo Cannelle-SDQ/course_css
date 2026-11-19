@@ -2,3 +2,8 @@
 .Rhistory
 .RData
 .Ruserdata
+
+/exercise5/train_validate_ess.csv
+/exercise5/test_ess.csv
+
+.DS_Store
